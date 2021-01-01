@@ -1,0 +1,280 @@
+---
+title: "Microarray analysis"
+output:
+  slidy_presentation: default
+  beamer_presentation: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+```{r include=FALSE}
+library(Biobase)
+library(limma)
+library(sva)
+library(ggplot2)
+library(pheatmap)
+library(RColorBrewer)
+library(ggrepel)
+library(dplyr)
+library(fgsea)
+```
+
+## Raw data
+
+- Gene expression analysis was made on Illumina HumanHT-12 v4.0 Gene Expression BeadChip
+- Raw data were Illumina summary probe profile files in .txt format:
+1) Sample Probe Profile
+2) Group Probe Profile 
+3) Control Probe Profile
+- Table in .txt with phenotype description for all samples 
+
+##  Sample Probe Profile
+
+- 16 group samples with 3 replicates for each sample
+
+
+##  Sample Probe Profile
+
+- For each sample: Average signal, Detection p-value, Bead Standard error, Average number of beads
+- 34694 genes
+- Description columns with Chromosome, Gene symbol, Definition, RefSeq Id, Entrez Id, Protein Id product, Array address Id, Probe start, Sequence, Orientation, Ontology component, process, function, etc.
+
+Average expression between the replicates - Group Sample Probe file.
+
+## The beginning
+
+- I made the slice of the sample probe data to get only sample groups with Gemini, VitD3, TX527 as a treatment and Ethanol as a control 
+(for all samples cell line was THP-1)
+
+- made an ExpressionSet
+
+```{r}
+sample_probe <-  read.csv('/home/marina/anaconda3/Документы/VitD/thp1data/110056_Sample_Probe_Profile.txt', sep = '\t')
+microarray_data <- sample_probe[,c(1,74,78,82,86,90,94,98,102,106,110,114,118,194,199, 208)]
+```
+
+```{r}
+expr <- as.matrix(microarray_data[, c(2:13)])
+row.names(expr) <- microarray_data$ProbeID
+feature <- microarray_data[, c('ProbeID', 'SYMBOL', 'DEFINITION', 'ENTREZ_GENE_ID')]
+row.names(feature) <- microarray_data$ProbeID
+feature <- AnnotatedDataFrame(feature)
+pheno <- as.data.frame(colnames(microarray_data[, c(2:13)]))
+colnames(pheno)[1] <- 'Treatment'
+pheno$Treatment <- gsub(".\\d+.AVG_Signal", "", pheno$Treatment)
+pheno$Treatment <- gsub("E", "Ethanol", pheno$Treatment)
+pheno$Treatment <- gsub("V", "VitD3", pheno$Treatment)
+pheno$Treatment <- gsub("TX", "TX527", pheno$Treatment)
+pheno$Treatment <- gsub("G", "Gemini", pheno$Treatment)
+pheno$Replicate <- as.factor(rep(1:3, each = 1))
+row.names(pheno) <- colnames(microarray_data[, c(2:13)])
+pheno <- AnnotatedDataFrame(pheno)
+microarraySet <- ExpressionSet(assayData = expr, phenoData = pheno, featureData = feature)
+```
+
+```{r}
+head(pData(microarraySet))
+```
+
+## ExpressionSet
+
+```{r}
+head(fData(microarraySet))
+```
+
+## ExpressionSet
+
+```{r}
+head(exprs(microarraySet)[, 1:3])
+```
+
+## The original distribution
+
+```{r message=FALSE, warning=FALSE}
+ggplot(data=data.frame(expression=exprs(microarraySet)[, 1]),
+       aes(x=expression)) +
+  geom_histogram()
+```
+
+
+
+## Log-transformation and quantile normalization
+
+```{r include=FALSE}
+exprs(microarraySet) <- normalizeBetweenArrays(log2(exprs(microarraySet)+1), method="quantile")
+```
+```{r message=FALSE, warning=FALSE}
+ggplot(data=data.frame(expression=exprs(microarraySet)[, 1]),
+       aes(x=expression)) +
+  geom_histogram()
+```
+
+
+## Mapping probes to genes:
+
+- Removed probes mapped to many genes and no genes
+- Calculated average probe expression
+- Sorted all probes by average expression
+- For each gene kept most-expressed probes
+- Left only top 12 000 expressed genes
+
+```{r include=FALSE}
+microarraySet <- microarraySet[!grepl("///", fData(microarraySet)$SYMBOL), ]
+microarraySet <- microarraySet[fData(microarraySet)$SYMBOL != "", ]
+
+fData(microarraySet)$mean_expression <- apply(exprs(microarraySet), 1, mean)
+microarraySet <- microarraySet[order(fData(microarraySet)$mean_expression, decreasing = TRUE), ]
+microarraySet <- microarraySet[!duplicated(fData(microarraySet)$ProbeID), ]
+microarraySet <- microarraySet[seq_len(12000), ]
+```
+
+```{r}
+dim(microarraySet)
+```
+
+## PCA
+
+```{r echo=FALSE}
+pcas <- prcomp(t(exprs(microarraySet)), scale. = T)
+plotData <- cbind(pcas$x[, 1:2], pData(microarraySet))
+ggplot(plotData, aes(x=PC1, y=PC2, color = Treatment, shape = Replicate)) +
+  geom_point() + theme_bw() + theme(aspect.ratio = 1)
+```
+
+## PCA plot after batch removal
+
+```{r include=FALSE}
+batch <- pData(microarraySet)$Replicate
+modcombat <- model.matrix(~1, data=pData(microarraySet))
+combat = ComBat(dat=exprs(microarraySet), batch=batch, mod=modcombat)
+
+```
+
+```{r echo=FALSE}
+pcas <- prcomp(t(combat), scale. = T)
+plotData <- cbind(pcas$x[, 1:2], pData(microarraySet))
+ggplot(plotData, aes(x=PC1, y=PC2, color = Treatment, shape = Replicate)) +
+  geom_point() + theme_bw() + theme(aspect.ratio = 1)
+```
+
+## Differential expression VitaminD3
+
+```{r}
+cell_full_model_VitD <- model.matrix(~0 + Treatment, data=pData(microarraySet)[c(1:6),])
+colnames(cell_full_model_VitD) <- c("VitD3neg", "VitD3pos")
+
+fit_VitD <- lmFit(microarraySet[,c(1:6)], cell_full_model_VitD)
+
+fit_VitD2 <- contrasts.fit(fit_VitD, makeContrasts(VitD3pos - VitD3neg, levels=cell_full_model_VitD))
+fit_VitD2 <- eBayes(fit_VitD2, trend = T)
+
+de_VitD <- topTable(fit_VitD2, adjust.method="BH", number=Inf, sort.by = "P")
+```
+
+Volcano Plot
+
+```{r}
+ggplot(de_VitD, aes(x=logFC, y=-log10(adj.P.Val), color=adj.P.Val < 0.05)) +
+  geom_point() + theme_bw() + scale_color_manual(values=c("black", "red")) +
+  geom_text_repel(data= de_VitD %>% dplyr::filter(adj.P.Val < 0.0001), aes(label=SYMBOL, color=NULL))
+```
+
+## Differential expression VitaminD3
+
+Table for top KEGG pathways
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+load("/home/marina/Загрузки/Analysis/keggSymbolHuman.rdata")
+stats <- de_VitD$t
+names(stats) <- de_VitD$SYMBOL
+
+fgseaResults <- fgseaMultilevel(keggSymbolHuman, stats, minSize = 15, maxSize = 500)
+topPathwaysUp <- fgseaResults[ES > 0, ][head(order(pval), n=5), pathway]
+topPathwaysDown <- fgseaResults[ES < 0, ][head(order(pval), n=5), pathway]
+topPathways <- c(topPathwaysUp, rev(topPathwaysDown))
+
+```
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+plotGseaTable(keggSymbolHuman[topPathways], stats, fgseaResults, gseaParam = 0.5)
+```
+
+
+
+## Differential expression Gemini
+
+```{r}
+cell_full_model_Gemini <- model.matrix(~0 + Treatment, data=pData(microarraySet)[c(1,2,3,7,8,9),])
+colnames(cell_full_model_Gemini) <- c("Gemini_neg", "Gemini_pos")
+
+fit_Gemini <- lmFit(microarraySet[,c(1,2,3,7,8,9)], cell_full_model_Gemini)
+
+fit_Gemini2 <- contrasts.fit(fit_Gemini, makeContrasts(Gemini_pos - Gemini_neg, levels=cell_full_model_Gemini))
+fit_Gemini2 <- eBayes(fit_Gemini2, trend = T)
+
+de_Gemini <- topTable(fit_Gemini2, adjust.method="BH", number=Inf, sort.by = "P")
+```
+
+Volcano Plot
+
+```{r}
+ggplot(de_Gemini, aes(x=logFC, y=-log10(adj.P.Val), color=adj.P.Val < 0.05)) +
+  geom_point() + theme_bw() + scale_color_manual(values=c("black", "red")) +
+  geom_text_repel(data= de_Gemini %>% dplyr::filter(adj.P.Val < 0.00001), aes(label=SYMBOL, color=NULL))
+```
+
+
+## Differential expression Gemini
+
+Table for top KEGG pathways
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+stats <- de_Gemini$t
+names(stats) <- de_Gemini$SYMBOL
+
+fgseaResults <- fgseaMultilevel(keggSymbolHuman, stats, minSize = 15, maxSize = 500)
+topPathwaysUp <- fgseaResults[ES > 0, ][head(order(pval), n=5), pathway]
+topPathwaysDown <- fgseaResults[ES < 0, ][head(order(pval), n=5), pathway]
+topPathways <- c(topPathwaysUp, rev(topPathwaysDown))
+plotGseaTable(keggSymbolHuman[topPathways], stats, fgseaResults, gseaParam = 0.5)
+```
+
+
+
+## Differential expression TX527
+
+```{r}
+cell_full_model_TX527 <- model.matrix(~0 + Treatment, data=pData(microarraySet)[c(1,2,3,10,11,12),])
+colnames(cell_full_model_TX527) <- c("TX527neg", "TX527pos")
+
+fit_TX527 <- lmFit(microarraySet[,c(1,2,3,10,11,12)], cell_full_model_TX527)
+
+fit_TX5272 <- contrasts.fit(fit_TX527, makeContrasts(TX527pos - TX527neg, levels=cell_full_model_TX527))
+fit_TX5272 <- eBayes(fit_TX5272, trend = T)
+
+de_TX527 <- topTable(fit_TX5272, adjust.method="BH", number=Inf, sort.by = "P")
+```
+
+Volcano Plot
+
+```{r}
+ggplot(de_TX527, aes(x=logFC, y=-log10(adj.P.Val), color=adj.P.Val < 0.05)) +
+  geom_point() + theme_bw() + scale_color_manual(values=c("black", "red")) +
+  geom_text_repel(data= de_TX527 %>% dplyr::filter(adj.P.Val < 0.000001), aes(label=SYMBOL, color=NULL))
+```
+
+## Differential expression TX527
+
+Table for top KEGG pathways
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+stats <- de_TX527$t
+names(stats) <- de_TX527$SYMBOL
+
+fgseaResults <- fgseaMultilevel(keggSymbolHuman, stats, minSize = 15, maxSize = 500)
+topPathwaysUp <- fgseaResults[ES > 0, ][head(order(pval), n=5), pathway]
+topPathwaysDown <- fgseaResults[ES < 0, ][head(order(pval), n=5), pathway]
+topPathways <- c(topPathwaysUp, rev(topPathwaysDown))
+plotGseaTable(keggSymbolHuman[topPathways], stats, fgseaResults, gseaParam = 0.5)
+```
+
